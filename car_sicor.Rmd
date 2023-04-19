@@ -1,0 +1,163 @@
+---
+title: "SICOR"
+author: "George Porto Ferreira"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DBI)
+library(tidyr)
+library(dplyr)
+library(sf)
+library(fs)
+library(tidyverse)
+library(httr)
+library(operators)
+
+options(timeout = 1500) # (in seconds) if your are in a limited connection increase timeout
+
+```
+
+Rural Credit data are made available by the Central Bank of Brazil from SICOR Database. More details about the types of credit and other information can be accessed through the link <https://www.bcb.gov.br/estabilidadefinanceira/creditorural>
+
+In this work we accessed data from two tables with data on rural properties and loan amounts received (SICOR_PROPRIEDADES & SICOR_LIBERACAO_RECURSOS)
+
+Model and data dictionary are available at the link below: <https://www.bcb.gov.br/estabilidadefinanceira/creditorural?modalAberto=tabelas_sicor>
+
+The code below loads the data from these two tables. If they do not exist in the working directory, they will be downloaded.
+
+```{r SICOR tables}
+
+# https://www.bcb.gov.br/htms/sicor/DadosBrutos/SICOR_PROPRIEDADES.gz
+# https://www.bcb.gov.br/htms/sicor/DadosBrutos/SICOR_LIBERACAO_RECURSOS.gz
+
+url_sicor <- 'https://www.bcb.gov.br/htms/sicor/DadosBrutos/'
+
+if (file.exists(here::here("SICOR_PROPRIEDADES.gz"))) {
+  sicor_propriedades <- gzfile(here::here("SICOR_PROPRIEDADES.gz")) %>%
+  read.csv(sep = ";")  
+  } else {
+    download.file(paste0(url_sicor,'SICOR_PROPRIEDADES.gz'), here::here("SICOR_PROPRIEDADES.gz"))
+    sicor_propriedades <- gzfile(here::here("SICOR_PROPRIEDADES.gz")) %>% 
+      read.csv(sep = ";")
+  }
+
+sicor_propriedades <- mutate(sicor_propriedades, ref_banuor = paste0(X.REF_BACEN, NU_ORDEM)) %>%
+  dplyr::select(-X.REF_BACEN, -NU_ORDEM) %>%
+  dplyr::filter(substr(CD_CAR,1,2) %in%  c('RO','PA','MT'))
+
+
+if (file.exists(here::here("SICOR_LIBERACAO_RECURSOS.gz"))) {
+  sicor_liberacao_recursos <- gzfile(here::here("SICOR_LIBERACAO_RECURSOS.gz")) %>%
+  read.csv(sep = ";")  
+  } else {
+    download.file(paste0(url_sicor,'SICOR_LIBERACAO_RECURSOS.gz'), here::here("SICOR_LIBERACAO_RECURSOS.gz"))
+    sicor_liberacao_recursos <- gzfile(here::here("SICOR_LIBERACAO_RECURSOS.gz")) %>% 
+      read.csv(sep = ";")
+  }
+
+sicor_liberacao_recursos <- mutate(sicor_liberacao_recursos, year = substr(X.LIR_DT_LIBERACAO,7,10), 
+                                   ref_banuor = paste0(REF_BACEN, NU_ORDEM)) %>%
+  dplyr::select(-X.LIR_DT_LIBERACAO, -REF_BACEN, -NU_ORDEM)%>%
+  dplyr::filter(year > 2012 & year < 2023 ) %>%
+  group_by(year, ref_banuor)%>%
+    summarize(total = sum(LIR_VL_LIBERADO))%>%
+  ungroup()%>%
+  pivot_wider(names_from = year, values_from = total) %>% 
+  mutate(total = sum(.[,2:11], na.rm=TRUE))
+
+```
+
+Spatial data with the delimitation of rural properties are made available by the Brazilian Forestry Service. Public access offers only the manual download municipality by municipality through the link <https://www.car.gov.br/publico/municipios/downloads>
+
+The Legal Amazon comprises 9 Brazilian states. However, in this study only the shapefiles of rural properties in the states of Rondônia, Mato Grosso and Pará were downloaded.
+
+Before running the code below, the shapefiles for each state must be downloaded and stored in different folders.
+
+The code below concatenates the shapefiles from the 141 municipalities in the state of Mato Grosso, plus the 144 municipalities in the state of Pará plus the 52 municipalities in the state of Rondônia.
+
+```{r CAR}
+
+# Getting all file paths
+
+shapesPA <- 'C:/geo/CAR/PA/lim' %>%
+  dir_ls(recurse = TRUE) %>%
+  str_subset('.shp$')
+
+shapesRO <- 'C:/geo/CAR/RO/lim' %>%
+  dir_ls(recurse = TRUE) %>%
+  str_subset('.shp$')
+
+shapesMT <- 'C:/geo/CAR/MT/lim' %>%
+  dir_ls(recurse = TRUE) %>%
+  str_subset('.shp$')
+
+shapefiles <- c(shapesMT,shapesPA,shapesRO)
+
+# Loading all files
+car_pamtro <- shapefiles %>%
+  map(st_read) %>%
+  bind_rows() %>%
+  st_transform(crs = 5880)
+```
+
+Every year the National Institute for Space Research (INPE) maps out the increase in deforestation based on satellite images. Information about the PRODES Project can be accessed through the link <http://www.obt.inpe.br/OBT/assuntos/programas/amazonia/prodes> The methodology @shimabukuroMappingMonitoringDeforestation2000 @valerianoMonitoringTropicalForest2004 used since 1988 has been improved over the years and today all policies to combat deforestation and the Brazilian NDC use PRODES data as a basis.
+
+The code below loads the data for processing.
+
+```{r Deforestation Data PRODES}
+
+prodes_path <- 'C:/geo/INPE/' #Define where is your PRODES Shapefile. If it doesn't exist will be downloaded here.
+prodes_url <- 'http://terrabrasilis.dpi.inpe.br/download/dataset/legal-amz-prodes/vector/yearly_deforestation.zip'
+  
+if (file.exists(paste0(prodes_path,'yearly_deforestation.shp'))) {
+    prodes <- st_read(paste0(prodes_path,'yearly_deforestation.shp'), 
+            query = "SELECT * FROM yearly_deforestation WHERE year > 2008 AND state IN('RO', 'PA', 'MT')"
+            )%>%
+    st_transform(crs = 5880)
+  } else {
+    download.file(prodes_url, paste0(prodes_path,'yearly_deforestation.zip'))
+    unzip(paste0(prodes_path,'yearly_deforestation.zip'), exdir = prodes_path)
+    prodes <- st_read(paste0(prodes_path,'yearly_deforestation.shp'),
+            query = "SELECT * FROM yearly_deforestation WHERE year > 2008 AND state IN('RO', 'PA', 'MT')"
+            )%>%
+    st_transform(crs = 5880)
+    file.remove(paste0(prodes_path,'yearly_deforestation.zip'))
+}
+
+```
+
+The analysis starts by identifying which rural properties suffered any deforestation after August 2008. It is important to understand that the PRODES data always comprise a 12-month period from August of one year to July of the following year.
+
+Another important concept to be understood is that of the expiration of the punitive intention. According to law 9605, in general, deforestation that has been committed 5 years or more ago can no longer receive a fine. In addition, law 12651 determines that deforestation committed without authorization after July 22, 2008 is not eligible for regularization.
+
+For these reasons, only data from PRODES after July 2008 are being used in this analysis. Furthermore, the SICOR data begin in 2013, which allows us to verify if, after 2013, any properties that received rural credit had committed deforestation in the previous 5 years. 
+
+```{r Intersection}
+
+ deforestation_in_car <- st_intersection(st_make_valid(car_pamtro), st_make_valid(prodes)) %>% 
+  mutate(area = st_area(.), 
+         CD_CAR = paste0(substr(COD_IMOVEL,1,2), 
+                         substr(COD_IMOVEL,4,10), 
+                         substr(COD_IMOVEL,12,43)
+                         )
+         ) %>% 
+  dplyr::select(NUM_AREA:NOM_MUNICI, image_date, year, area, CD_CAR)
+
+deforestation_in_car <- dplyr::group_by(deforestation_in_car, CD_CAR) %>% 
+  dplyr::summarise(deforestation = sum(area))
+
+```
+
+## 
+
+```{r , echo=FALSE}
+
+deforestation_in_car_w_credit <- inner_join(deforestation_in_car, sicor_propredades, by = "CD_CAR")
+
+deforestation_in_car_wo_credit <- dplyr::filter(deforestation_in_car, CD_CAR %!in% sicor_propredades)
+
+```
+

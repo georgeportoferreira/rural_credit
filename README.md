@@ -1,15 +1,20 @@
 # Rural Credit 
+## Abstract
+Rural credit for agriculture and cattle ranching, in some cases, can be a driver of deforestation, mainly because low-cost capital with government subsidies is available for investment in increasing agricultural and cattle ranching production. Currently, the cheapest way to increase productivity is still converting new areas of native vegetation to pasture or monoculture, which implies a loss of biodiversity and emission of greenhouse gases. In this study, we show that policies that prevent rural credit from being used to commit new deforestation have not worked in some cases.
 
+## Central Bank Data
 The Central Bank of Brazil makes rural credit data available from the SICOR Database. More details about the types of credit and other information can be accessed through the link <https://www.bcb.gov.br/estabilidadefinanceira/creditorural>
 
 In this work, we accessed data from two tables with data on rural properties and loan amounts received (SICOR_PROPRIEDADES & SICOR_LIBERACAO_RECURSOS)
 
 The model and data dictionary are available at the link below: <https://www.bcb.gov.br/estabilidadefinanceira/creditorural?modalAberto=tabelas_sicor>
 
+## Rural Environmental Registry
 The Brazilian Forestry Service makes spatial data with the delimitation of rural properties available. Public access offers only the manual download municipality by municipality through the link <https://www.car.gov.br/publico/municipios/downloads>
 
 The Legal Amazon comprises 9 Brazilian states. However, in this study only, the shapefiles of rural properties in Rondônia, Mato Grosso and Pará were downloaded.
 
+## Deforestation data
 Every year the National Institute for Space Research (INPE) maps out the increase in deforestation based on satellite images. Information about the PRODES Project can be accessed through the link [http://www.obt.inpe.br/OBT/assuntos/programas/amazonia/prodes](#0){.uri}. The methodology used since 1988 has been improved over the years, and today, all policies to combat deforestation and the Brazilian NDC use PRODES data as a basis.
 
 The analysis starts by identifying which rural properties suffered any deforestation after August 2008. It is essential to understand that the PRODES data always comprise 12 months from August of one year to July of the following year.

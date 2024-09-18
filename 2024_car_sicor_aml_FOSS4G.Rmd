@@ -1,0 +1,609 @@
+---
+title: "Rural Credit and Deforestation"
+author: "George Porto Ferreira"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r Setup, eval=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if (!"tidyverse" %in% installed.packages()) {
+  install.packages("tidyverse")
+}
+if (!"fs" %in% installed.packages()) {
+  install.packages("fs")
+}
+if (!"here" %in% installed.packages()) {
+  install.packages("here")
+}
+if (!"tsibble" %in% installed.packages()) {
+  install.packages("tsibble")
+}
+if (!"terra" %in% installed.packages()) {
+  install.packages("terra")
+}
+
+library(tidyverse)
+library(fs)
+library(here)
+library(tsibble)
+library(terra)
+
+options(timeout = 5500) # (in seconds) if your are in a limited connection increase timeout
+```
+
+# SICOR
+
+Rural Credit data are made available by the Central Bank of Brazil from
+SICOR Database. More details about the types of credit and other
+information can be accessed through the link
+<https://www.bcb.gov.br/estabilidadefinanceira/creditorural>
+
+In this work we accessed data from three tables with data on rural
+properties and loan amounts received (SICOR_PROPRIEDADES, SICOR_OPERACAO_BASICA and
+SICOR_LIBERACAO_RECURSOS)
+
+Model and data dictionary are available at the link below:
+<https://www.bcb.gov.br/estabilidadefinanceira/creditorural?modalAberto=tabelas_sicor>
+
+The code below loads the data from these three tables into memory.
+If the tables do not exist in the working directory, they will be downloaded.
+
+The code below loads the data from these three tables into a Spatialite Database named rural_credit for visualization using QGIS GIS Desktop. 
+
+
+```{r SICOR Data, eval=FALSE}
+# SICOR_PROPRIEDADES --------------------
+# https://www.bcb.gov.br/htms/sicor/DadosBrutos/SICOR_PROPRIEDADES.gz
+url_sicor <- "https://www.bcb.gov.br/htms/sicor/DadosBrutos/"
+
+if (!file.exists(here::here("SICOR_PROPRIEDADES.gz"))) {
+  download.file(paste0(url_sicor, "SICOR_PROPRIEDADES.gz"), here::here("SICOR_PROPRIEDADES.gz"))
+}
+
+sicor_propriedades <- gzfile(here::here("SICOR_PROPRIEDADES.gz")) |>
+  read.csv(sep = ";") |>
+  mutate(
+    REF_BACEN = X.REF_BACEN,
+    cod_imovel = paste0(substr(CD_CAR, 1, 2), "-", substr(CD_CAR, 3, 9), "-", substr(CD_CAR, 10, 41)),
+    uf = paste0(substr(CD_CAR, 1, 2))
+  ) |>
+  dplyr::select(-X.REF_BACEN, -CD_CAR, -CD_CNPJ_CPF, -CD_SNCR, -CD_NIRF) |>
+  dplyr::filter(uf %in% c("RO", "PA", "MT"))
+
+# SICOR LIBERACAO RECURSOS --------------------------
+if (!file.exists(here::here("SICOR_LIBERACAO_RECURSOS.gz"))) {
+  download.file(paste0(url_sicor, "SICOR_LIBERACAO_RECURSOS.gz"), here::here("SICOR_LIBERACAO_RECURSOS.gz"))
+}
+
+sicor_liberacao_recursos <- gzfile(here::here("SICOR_LIBERACAO_RECURSOS.gz")) |> # 2min
+  read.csv(sep = ";") |>
+  mutate(year_treat = as.integer(substr(X.LIR_DT_LIBERACAO, 7, 10)), DT_LIBERACAO = X.LIR_DT_LIBERACAO) |>
+  dplyr::select(-X.LIR_DT_LIBERACAO) |>
+  dplyr::filter(year_treat > 2012 & year_treat < 2024) |>
+  group_by(REF_BACEN, NU_ORDEM, year_treat) |> # There are different values for same REF_BACEN and NU_ORDEM
+  summarize(VL_LIBERADO = sum(LIR_VL_LIBERADO), .groups = "drop")
+
+# SICOR_OPERACAO_BASICA --------------------------
+# https://www.bcb.gov.br/htms/sicor/DadosBrutos/SICOR_OPERACAO_BASICA *YEAR* .gz
+
+sicor_operacao_basica <- list()
+# Function to check if the file exists and read or download and read the file
+process_year <- function(ano) {
+  file_path <- here::here(paste0("SICOR_OPERACAO_BASICA_ESTADO_", ano, ".gz"))
+  if (!file.exists(file_path)) {
+    download.file(paste0(url_sicor, "SICOR_OPERACAO_BASICA_ESTADO_", ano, ".gz"), file_path)
+  }
+  data <- read.csv(gzfile(file_path), sep = ";") %>%
+    mutate(
+      REF_BACEN = X.REF_BACEN, # create ID
+      DT_EMISSAO = as.Date(DT_EMISSAO, format = "%m/%d/%Y"),
+      DT_VENCIMENTO = as.Date(DT_VENCIMENTO, format = "%m/%d/%Y")
+    ) |>
+    dplyr::select(-CD_CONTRATO_STN, -X.REF_BACEN) |> # Drop unused columns
+    dplyr::filter(CD_ESTADO %in% c("RO", "PA", "MT"))
+  return(data)
+}
+
+years <- 2013:(year(Sys.Date()) - 1)
+sicor_operacao_basica <- map(years, process_year, .progress = TRUE) %>% bind_rows()
+```
+
+# CAR
+
+Spatial data with the delimitation of rural properties are made
+available by the Brazilian Forestry Service. Public access offers only
+the manual download state by state through the link
+<https://www.car.gov.br/publico/estados/downloads>
+
+The Legal Amazon comprises 9 Brazilian states. Amazonas, Para, Mato
+Grosso, Amapá, Roraima, Rondônia, Acre, Totantins and half of Maranhão,
+
+Before running the code below, the shapefiles for each state must be
+downloaded and stored in different folders.
+
+The code below concatenates the shapefiles from the nine states.
+
+```{r Create Folder CAR}
+# Define the path to the folder
+folder_path <- paste0("C:/Users/", Sys.getenv("USERNAME"), "/Downloads/car")
+
+# Check if the folder already exists
+if (!dir.exists(folder_path)) {
+  # Create the folder if it does not exist
+  dir.create(folder_path)
+  cat("Folder 'CAR' created successfully.\n")
+} else {
+  cat("Folder 'CAR' already exists.\n")
+}
+
+ext <- c(".dbf", ".shp", ".shx", ".prj")
+```
+
+Once the folder is created, compacted shapefiles can now be manually downloaded from <https://www.car.gov.br/publico/estados/downloads>, click on "Base de Downloads" and download desired states to `r folder_path`
+
+```{r Download CAR manually, eval=FALSE}
+# Download manually since there is a human check to avoid bots
+```
+
+Run chunk below to unzip files
+
+```{r Unzip Files, eval=FALSE}
+zipfiles <- folder_path %>% dir_ls()
+
+for (i in 1:length(zipfiles)) {
+  unzip(zipfiles[i], exdir = substr(zipfiles[i], 1, nchar(zipfiles[i]) - 4))
+}
+
+level1_unziped_folders <- substr(zipfiles, 1, nchar(zipfiles) - 4) %>%
+  dir_ls() %>%
+  str_subset("AREA_IMOVEL_1.shp$")
+
+for (i in 1:length(level1_unziped_folders)) {
+  file.rename(
+    paste0(substr(zipfiles[i], 1, nchar(zipfiles[i]) - 4), "/AREA_IMOVEL_1", ext),
+    paste0(
+      substr(zipfiles[i], 1, nchar(zipfiles[i]) - 4),
+      substr(zipfiles[i], nchar(zipfiles[i]), nchar(zipfiles[i]) - 4), ext
+    )
+  )
+}
+```
+
+Create CAR SaptialVect from three states
+
+```{r Load and Merge CAR Shapefiles, eval=FALSE} 
+# Getting all file paths
+folder_path <- paste0("C:/Users/", Sys.getenv("USERNAME"), "/Downloads/car")
+shapefiles_car <- folder_path %>%
+  dir_ls(recurse = TRUE) %>%
+  str_subset(".shp$")
+
+car_aml <- shapefiles_car %>%
+  map(vect, crs = "epsg:4674", .progress = TRUE) %>%
+  reduce(rbind) %>%
+  makeValid() %>%
+  subset(
+    des_condic != "Cancelado por duplicidade" & # duplicates
+      ind_tipo == "IRU" & # IRU = Rural Properties
+      num_area >= 1, # keep only properties grater than 1 ha
+    c(cod_imovel, num_area, municipio, cod_estado), # variables to keep
+    NSE = TRUE
+  )
+
+distinct_attribute <- car_aml %>%
+  as.data.frame() %>%
+  distinct(cod_imovel, .keep_all = TRUE) %>%
+  filter(cod_estado %in% c("RO", "PA", "MT"))
+
+# Join the distinct attributes back to the original spatial vector to get the unique SpatVector
+car_aml <- car_aml[car_aml$cod_imovel %in% distinct_attribute$cod_imovel, ]
+```
+# INPE
+
+Every year the National Institute for Space Research (INPE) maps out the
+increase in deforestation based on satellite images. Information about
+the PRODES Project can be accessed through the link
+<http://www.obt.inpe.br/OBT/assuntos/programas/amazonia/prodes> The
+methodology @shimabukuroMappingMonitoringDeforestation2000
+@valerianoMonitoringTropicalForest2004 used since 1988 has been improved
+over the years and today all policies to combat deforestation and the
+Brazilian NDC use PRODES data as a basis.
+
+
+
+The code below loads the data for processing.
+
+```{r Deforestation Data PRODES, eval=FALSE}
+# Deforestation ----
+inpe_path <- paste0("C:/Users/", Sys.getenv("USERNAME"), "/Downloads/")
+
+prodes_url <- "https://terrabrasilis.dpi.inpe.br/download/dataset/legal-amz-prodes/vector/yearly_deforestation.zip"
+forest_url <- "https://terrabrasilis.dpi.inpe.br/download/dataset/legal-amz-prodes/vector/forest.zip"
+
+# Define paths
+prodes_path <- paste0(inpe_path, "yearly_deforestation.shp")
+zipfile_path <- paste0(inpe_path, "yearly_deforestation.zip")
+
+# Function to download and unzip the shapefile
+download_and_unzip <- function(url, zip_path, exdir) {
+  download.file(url, zip_path)
+  unzip(zip_path, exdir = exdir)
+  file.remove(zip_path)
+}
+
+# Check if the shapefile exists
+if (!file.exists(prodes_path)) {
+  download_and_unzip(prodes_url, zipfile_path, inpe_path)
+}
+
+prodes <- vect(prodes_path, crs = "epsg:4674") %>%
+  makeValid() %>%
+  subset(state %in% c("RO", "PA", "MT"), NSE = TRUE) # 50sec
+
+# Forest ----
+# forest_biome.zip is more than 10 GB. If the download fails, download it manually at "https://terrabrasilis.dpi.inpe.br/download/dataset/legal-amz-prodes/vector/forest.zip"
+
+forest_path <- paste0(inpe_path, "forest_biome_FOREST_2016.shp")
+zipforest_path <- paste0(inpe_path, "forest_biome.zip")
+
+if (!file.exists(zipforest_path)) {
+  download_and_unzip(forest_url, zipforest_path, inpe_path)
+}
+
+zipfile_path <- paste0(inpe_path, "forest_biome_FOREST_2016.zip")
+if (!file.exists(forest_path)) {
+  unzip(zipfile_path, exdir = inpe_path)
+}
+
+
+forest <- vect(forest_path, crs = "epsg:4674", what = "geoms") %>% makeValid() # 50sec
+```
+
+# Analysis
+
+The analysis starts by identifying which rural properties suffered
+deforestation after August 2008. It is important to understand that the
+PRODES data always comprise a 12-month period from August of one year to
+July of the following year.
+
+Another important concept to be understood is that of the expiration of
+the punitive intention. According to law 9605, in general, deforestation
+that has been committed 5 years or more ago can no longer receive a
+fine. In addition, law 12651 determines that deforestation committed
+without authorization after July 22, 2008 is not eligible for
+regularization.
+
+For these reasons, only data from PRODES after July 2008 are being used
+in this analysis. Furthermore, the SICOR data begin in 2013, which
+allows us to verify if, after 2013, any properties that received rural
+credit had committed deforestation in the previous 5 years.
+
+```{r Calculations, eval=FALSE}
+forest_in_car <- car_aml * forest
+
+forest_in_car$area_forest <- expanse(forest_in_car, unit = "ha")
+
+forest_in_car_df <- as.data.frame(forest_in_car) %>%
+  group_by(cod_imovel) %>%
+  summarise(
+    area_forest_2016 = as.numeric(sum(area_forest, na.rm = TRUE)),
+    num_area = first(num_area),
+    municipio = first(municipio),
+    cod_estado = first(cod_estado),
+    .groups = "drop"
+  ) %>%
+  mutate(percent_forest = as.numeric(area_forest_2016 / num_area)) %>%
+  filter(percent_forest > 0.1)
+
+
+deforestation_in_car <- prodes * car_aml[car_aml$cod_imovel %in% forest_in_car_df$cod_imovel, ]
+
+deforestation_in_car$area_deforestation <- expanse(deforestation_in_car, unit = "ha")
+
+deforestation_in_car_df <- as.data.frame(deforestation_in_car) %>%
+  group_by(cod_imovel, year) %>%
+  summarise(
+    deforestation_ha = as.numeric(sum(area_deforestation, na.rm = TRUE)),
+    num_area = first(num_area),
+    municipio = first(municipio),
+    cod_estado = first(cod_estado),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    percent_deforestation = as.numeric(deforestation_ha / num_area),
+    year_prodes = year
+  ) %>%
+  select(-year, -num_area)
+
+
+forest_n_def_in_car <- left_join(forest_in_car_df, deforestation_in_car_df, by = "cod_imovel")
+
+# WARNING! There will be duplicated values for deforestation area inherited from deforestation_in_car and also duplicated values in credit values because cardinality between liberacao_recursos and propriedades is many-to-many
+
+deforestation_and_values <- full_join(forest_n_def_in_car,
+  sicor_propriedades,
+  by = "cod_imovel",
+  relationship = "many-to-many"
+) %>%
+  group_by(cod_imovel) %>%
+  summarise(
+    deforestation_ha = sum(deforestation_ha),
+    municipio = first(municipio.x),
+    cod_estado = first(cod_estado.x),
+    num_area = first(num_area),
+    area_forest_2016 = first(area_forest_2016),
+    REF_BACEN = first(REF_BACEN),
+    NU_ORDEM = first(NU_ORDEM),
+    .groups = "drop"
+  ) %>%
+  full_join(sicor_liberacao_recursos,
+    by = c("REF_BACEN", "NU_ORDEM"),
+    relationship = "many-to-many"
+  ) %>%
+  group_by(cod_imovel) %>%
+  summarise(
+    deforestation_ha = first(deforestation_ha),
+    municipio = first(municipio),
+    cod_estado = first(cod_estado),
+    area_forest_2016 = first(area_forest_2016),
+    vl_liberado = sum(VL_LIBERADO),
+    .groups = "drop"
+  )
+
+deforestation_and_values_filtered <- deforestation_and_values %>%
+  dplyr::filter(!is.na(deforestation_ha) &
+    (!is.na(vl_liberado)))
+```
+# Statistics
+
+```{r Statistics, eval=FALSE}
+results <- deforestation_and_values %>%
+  dplyr::filter(!is.na(deforestation_ha) &
+    (!is.na(vl_liberado))) %>%
+  group_by(cod_estado) %>%
+  summarise(
+    deforestation_ha = sum(deforestation_ha),
+    area_forest_2016 = sum(area_forest_2016),
+    vl_liberado = sum(vl_liberado),
+    qtd_property = n(),
+    .groups = "drop"
+  )
+
+results
+```
+
+# Results
+
+Statistics for total amount of Deforestation, Rural Properties and Rural Credit per state came from the following sources:
+
+Deforestation: INPE. (2024). Incremento no desmatamento da Amazônia Legal à partir de 2008 (Geospatial a5220c18-f7fa-4e3e-b39b-feeb3ccc4830; Version 2023) [ESRI-ShapeFile]. Terrabrasilis. https://terrabrasilis.dpi.inpe.br/geonetwork/srv/eng/catalog.search#/metadata/a5220c18-f7fa-4e3e-b39b-feeb3ccc4830
+
+Rural Properties: SFB. (2024). Cadastro Ambiental Rural (Version v3.47.1) [Geospatial; ESRI-ShapeFile]. SICAR. https://consultapublica.car.gov.br/publico/imoveis/index
+
+Rural Credit:BCB. (2024). Tabelas e Microdados do Crédito Rural e do Proagro (Version 2024) [Table; CSV]. SICOR. https://www.bcb.gov.br/estabilidadefinanceira/tabelas-credito-rural-proagro
+
+# Spatialite Database creation---
+
+```{r, eval=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if (!"RSQLite" %in% installed.packages()) {
+  install.packages("RSQLite")
+}
+if (!"DBI" %in% installed.packages()) {
+  install.packages("DBI")
+}
+if (!"archive" %in% installed.packages()) {
+  install.packages("archive")
+}
+
+library(RSQLite)
+library(DBI)
+library(archive)
+```
+
+The code below creates a Spatialite Database named rural_credit to explore spatial data using QGIS Desktop. 
+```{r Spatialite download, eval=FALSE}
+# Download and create Spatialite DataBase ----
+url_spatialite <- "http://www.gaia-gis.it/gaia-sins/windows-bin-amd64/mod_spatialite-5.1.0-win-amd64.7z"
+if (!file.exists(here::here("mod_spatialite-5.1.0-win-amd64.7z"))) {
+  download.file(url_spatialite, here::here("mod_spatialite-5.1.0-win-amd64.7z"), method = "curl")
+}
+
+file <- "mod_spatialite-5.1.0-win-amd64.7z"
+archive_extract(file)
+
+# Get the current PATH environment variable
+current_path <- Sys.getenv("PATH")
+
+# Add the new path to the existing PATH
+new_path <- paste(current_path, here::here("mod_spatialite-5.1.0-win-amd64"), sep = ";")
+
+# Set the new PATH environment variable
+Sys.setenv(PATH = new_path)
+```
+
+# Creat connection to Spatialite DataBase
+
+```{r Connect, eval=FALSE}
+# Create a connection to a new SQLite database file where sicor tables will be stored
+paste("Database will be created at", getwd())
+
+conn <- dbConnect(RSQLite::SQLite(), "rural_credit.sqlite")
+
+# Enable SpatiaLite extension
+dbExecute(conn, "SELECT load_extension('mod_spatialite');")
+
+# Initialize SpatiaLite metadata (it will take several minutes)
+dbExecute(conn, "SELECT InitSpatialMetaData();")
+```
+
+# Load data to Spatialite database
+
+```{r Creat tables, eval=FALSE}
+# Write sicor_operacao_basica data to DB ----
+dbExecute(
+  conn,
+  "CREATE TABLE `sicor_operacao_basica` (
+  `REF_BACEN` INTEGER,
+  `NU_ORDEM` INTEGER,
+  `CNPJ_IF` INTEGER,
+  `DT_EMISSAO` REAL,
+  `DT_VENCIMENTO` REAL,
+  `CD_INST_CREDITO` INTEGER,
+  `CD_CATEG_EMITENTE` INTEGER,
+  `CD_FONTE_RECURSO` INTEGER,
+  `CNPJ_AGENTE_INVEST` INTEGER,
+  `CD_ESTADO` TEXT,
+  `CD_REF_BACEN_INVESTIMENTO` REAL,
+  `CD_TIPO_SEGURO` INTEGER,
+  `CD_EMPREENDIMENTO` REAL,
+  `CD_PROGRAMA` INTEGER,
+  `CD_TIPO_ENCARG_FINANC` INTEGER,
+  `CD_TIPO_IRRIGACAO` INTEGER,
+  `CD_TIPO_AGRICULTURA` INTEGER,
+  `CD_FASE_CICLO_PRODUCAO` INTEGER,
+  `CD_TIPO_CULTIVO` INTEGER,
+  `CD_TIPO_INTGR_CONSOR` INTEGER,
+  `CD_TIPO_GRAO_SEMENTE` INTEGER,
+  `VL_ALIQ_PROAGRO` REAL,
+  `VL_JUROS` REAL,
+  `VL_PRESTACAO_INVESTIMENTO` REAL,
+  `VL_PREV_PROD` REAL,
+  `VL_QUANTIDADE` REAL,
+  `VL_RECEITA_BRUTA_ESPERADA` REAL,
+  `VL_PARC_CREDITO` REAL,
+  `VL_REC_PROPRIO` REAL,
+  `VL_PERC_RISCO_STN` REAL,
+  `VL_PERC_RISCO_FUNDO_CONST` REAL,
+  `VL_REC_PROPRIO_SRV` REAL,
+  `VL_AREA_FINANC` REAL,
+  `CD_SUBPROGRAMA` INTEGER,
+  `VL_PRODUTIV_OBTIDA` REAL,
+  `DT_FIM_COLHEITA` TEXT,
+  `DT_FIM_PLANTIO` TEXT,
+  `DT_INIC_COLHEITA` TEXT,
+  `DT_INIC_PLANTIO` TEXT,
+  `VL_JUROS_ENC_FINAN_POSFIX` REAL,
+  `VL_PERC_CUSTO_EFET_TOTAL` REAL,
+  `CD_CNPJ_CADASTRANTE` INTEGER,
+  `VL_AREA_INFORMADA` REAL,
+  `CD_CICLO_CULTIVAR` INTEGER,
+  `CD_TIPO_SOLO` INTEGER,
+  `PC_BONUS_CAR` INTEGER,
+   PRIMARY KEY (REF_BACEN, NU_ORDEM)
+);"
+)
+
+dbWriteTable(conn, "sicor_operacao_basica", sicor_operacao_basica, append = TRUE)
+
+# Write sicor_liberacao_recursos data to DB ----
+dbExecute(
+  conn,
+  "CREATE TABLE `sicor_liberacao_recursos` (
+  `VL_LIBERADO` REAL,
+  `REF_BACEN` INTEGER,
+  `NU_ORDEM` INTEGER,
+  `year_treat` TEXT,
+   PRIMARY KEY (year_treat, REF_BACEN, NU_ORDEM),
+   FOREIGN KEY (REF_BACEN, NU_ORDEM) REFERENCES sicor_operacao_basica(REF_BACEN, NU_ORDEM)
+);"
+)
+
+dbWriteTable(conn, "sicor_liberacao_recursos", sicor_liberacao_recursos, append = TRUE)
+
+
+# Write CAR data to DB ----
+dbExecute(
+  conn,
+  "CREATE TABLE `car_aml` (
+  `cod_imovel` TEXT PRIMARY KEY,
+  `mod_fiscal` REAL,
+  `num_area` REAL,
+  `ind_status` TEXT,
+  `ind_tipo` TEXT,
+  `des_condic` TEXT,
+  `municipio` TEXT,
+  `cod_estado` TEXT,
+  `geometry` geometry,
+  `wkt` TEXT);"
+)
+
+car_aml_df <- as.data.frame(car_aml)
+car_aml_df$wkt <- car_aml@ptr$getGeometryWKT() # create wkt to load on Spatialite
+dbWriteTable(conn, "car_aml_df", as.data.frame(car_aml), append = TRUE)
+dbExecute(conn, "SELECT AddGeometryColumn('car_aml', 'geom', 5880, 'MULTIPOLYGON', 'XY');")
+dbExecute(conn, "UPDATE car_aml SET geom = ST_GeomFromText(wkt, 5880);")
+
+# Write PRODES data to DB ----
+dbExecute(
+  conn,
+  "CREATE TABLE `prodes` (
+  `fid` INTEGER PRIMARY KEY ,
+  `state` TEXT,
+  `path_row` TEXT,
+  `main_class` TEXT,
+  `class_name` TEXT,
+  `sub_class` TEXT,
+  `def_cloud` REAL,
+  `julian_day` INTEGER,
+  `image_date` REAL,
+  `year` REAL,
+  `area_km` REAL,
+  `scene_id` INTEGER,
+  `source` TEXT,
+  `satellite` TEXT,
+  `sensor` TEXT,
+  `uuid` TEXT,
+  `wkt` TEXT,
+  `_ogr_geometry_` geometry);"
+)
+
+
+prodes_df <- as.data.frame(prodes)
+prodes_df$wkt <- prodes@ptr$getGeometryWKT() # create wkt to load on Spatialite
+dbWriteTable(conn, "prodes_df", as.data.frame(prodes), append = TRUE)
+dbExecute(conn, "SELECT AddGeometryColumn('prodes', 'geom', 5880, 'MULTIPOLYGON', 'XY');")
+dbExecute(conn, "UPDATE prodes SET geom = ST_GeomFromText(wkt, 5880);")
+
+# Write sicor_propriedades data to DB ----
+dbExecute(
+  conn,
+  "CREATE TABLE `sicor_propriedades` (
+  `REF_BACEN` INTEGER,
+  `NU_ORDEM` INTEGER,
+  `cod_imovel` TEXT,
+  `uf` TEXT,
+  FOREIGN KEY (REF_BACEN, NU_ORDEM) REFERENCES sicor_operacao_basica(REF_BACEN, NU_ORDEM),
+  FOREIGN KEY (cod_imovel) REFERENCES car_aml(cod_imovel)
+);"
+)
+
+dbWriteTable(conn, "sicor_propriedades", sicor_propriedades, append = TRUE)
+
+# Write deforestation and loan values (filtred) data to DB ----
+dbExecute(
+  conn,
+  "CREATE TABLE `deforestation_and_values_f` (
+  `cod_imovel` TEXT PRIMARY KEY,
+  `deforestation_ha` REAL,
+  `municipio` TEXT,
+  `cod_estado` TEXT,
+  `area_forest_2016` REAL,
+  `vl_liberado` REAL
+);"
+)
+
+dbWriteTable(conn, "deforestation_and_values_f", deforestation_and_values_filtered, append = TRUE)
+
+
+# Close the database connection
+dbDisconnect(conn)
+```

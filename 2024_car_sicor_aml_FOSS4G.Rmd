@@ -235,9 +235,8 @@ if (!file.exists(prodes_path)) {
 }
 
 prodes <- vect(prodes_path, crs = "EPSG:4674") %>%
-  makeValid() %>%
-  subset(state %in% states, NSE = TRUE) # 50sec
-
+  subset(state %in% states, NSE = TRUE) %>% # 50sec
+  makeValid()
 # Deforestation 2007 and befor ----
 
 prodes2007_path <- paste0(temp_folder, "\\accumulated_deforestation_2007.shp")
@@ -252,8 +251,8 @@ if (!file.exists(prodes2007_path)) {
 }
 
 accumulated_prodes <- vect(prodes2007_path, crs = "EPSG:4674") %>%
-  makeValid() %>%
-  subset(state %in% states, NSE = TRUE)
+  subset(state %in% states, NSE = TRUE) %>% 
+    makeValid()
 
 allprodes <- rbind(accumulated_prodes, prodes)
 
@@ -576,9 +575,9 @@ dbExecute(
 
 car_aml_df <- as.data.frame(car_aml)
 car_aml_df$wkt <- car_aml@ptr$getGeometryWKT() # create wkt to load on Spatialite
-dbWriteTable(conn, "car_aml_df", as.data.frame(car_aml), append = TRUE)
-dbExecute(conn, "SELECT AddGeometryColumn('car_aml', 'geom', 5880, 'MULTIPOLYGON', 'XY');")
-dbExecute(conn, "UPDATE car_aml SET geom = ST_GeomFromText(wkt, 5880);")
+dbWriteTable(conn, "car_aml", car_aml_df, append = TRUE)
+dbExecute(conn, "SELECT AddGeometryColumn('car_aml', 'geom', 4674, 'POLYGON', 'XY');")
+dbExecute(conn, "UPDATE car_aml SET geom = ST_GeomFromText(wkt, 4674);")
 
 # Write PRODES data to DB ----
 dbExecute(
@@ -607,9 +606,9 @@ dbExecute(
 
 prodes_df <- as.data.frame(prodes)
 prodes_df$wkt <- prodes@ptr$getGeometryWKT() # create wkt to load on Spatialite
-dbWriteTable(conn, "prodes_df", as.data.frame(prodes), append = TRUE)
+dbWriteTable(conn, "prodes", prodes_df, append = TRUE)
 dbExecute(conn, "SELECT AddGeometryColumn('prodes', 'geom', 5880, 'MULTIPOLYGON', 'XY');")
-dbExecute(conn, "UPDATE prodes SET geom = ST_GeomFromText(wkt, 5880);")
+dbExecute(conn, "UPDATE prodes SET geom = ST_GeomFromText(wkt, 4674);")
 
 # Write sicor_propriedades data to DB ----
 dbExecute(
